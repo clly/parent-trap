@@ -7,12 +7,15 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
 	"time"
 )
 
 type config struct {
-	addr string
-	port string
+	addr      string
+	port      string
+	sleepTime int
 }
 
 type command int
@@ -20,6 +23,7 @@ type command int
 const (
 	stop command = iota
 	restart
+	start
 )
 
 func main() {
@@ -51,14 +55,27 @@ func main() {
 
 	commandChan := make(chan command)
 	fmt.Println("starting server")
-	svr(conf, commandChan)
+	svr(conf, commandChan, time.Duration(conf.sleepTime))
 
 	fmt.Println("Waiting for commands")
-	go func(cmd *exec.Cmd, commandChan chan command, cmdDone chan struct{}) {
+	go func(cmd *exec.Cmd, commandChan chan command, cmdDone chan struct{}, sleepTime time.Duration) {
 		for {
 			select {
 			case c := <-commandChan:
 				switch c {
+				case start:
+					fmt.Println("starting process")
+					cmd = mkCommand(bin, args)
+					err = cmd.Start()
+					if err != nil {
+						fmt.Fprintln(os.Stderr, "failed to start process:", bin)
+						os.Exit(1)
+					}
+					// we assume that it got written
+					go func(cmd *exec.Cmd) {
+						cmd.Wait()
+						cmdDone <- struct{}{}
+					}(cmd)
 				case stop:
 					fmt.Println("stopping process")
 					pid := cmd.Process.Pid
@@ -67,14 +84,13 @@ func main() {
 					if err != nil {
 						fmt.Println("Failed to signal process", pid)
 					}
-					time.Sleep(time.Second * 10)
+					time.Sleep(time.Second * sleepTime)
 					select {
 					case _ = <-cmdDone:
-						os.Exit(0)
+						fmt.Println("Process stopped")
 					default:
 					}
 					cmd.Process.Kill()
-					os.Exit(0)
 				case restart:
 					fmt.Println("stopping process")
 					pid := cmd.Process.Pid
@@ -84,7 +100,7 @@ func main() {
 						fmt.Println("Failed to signal process", pid)
 					}
 					fmt.Println("sleeping")
-					time.Sleep(time.Second * 3)
+					time.Sleep(sleepTime * time.Second)
 					select {
 					case _ = <-cmdDone:
 						fmt.Println("command should be done")
@@ -120,9 +136,10 @@ func main() {
 				time.Sleep(time.Second * 1)
 			}
 		}
-	}(cmd, commandChan, cmdDone)
+	}(cmd, commandChan, cmdDone, time.Duration(conf.sleepTime))
 
 	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	for {
 		sig := <-signals
 		fmt.Println(sig)
@@ -136,23 +153,34 @@ func main() {
 func flags() config {
 	addr := flag.String("http-addr", "127.0.0.1", "Address to bind on for HTTP Server")
 	port := flag.String("http-port", "6060", "Port to bind on for HTTP Server")
+	sleepTime := flag.Int("sleep-time", 3, "sleep time in seconds after triggering an action")
 	flag.Parse()
 	return config{
-		addr: *addr,
-		port: *port,
+		addr:      *addr,
+		port:      *port,
+		sleepTime: *sleepTime,
 	}
 }
 
-func svr(c config, ch chan<- command) {
+func svr(c config, ch chan<- command, sleepTime time.Duration) {
 	go func() {
 		log.Fatal(http.ListenAndServe(fmt.Sprintf("%s:%s", c.addr, c.port), http.HandlerFunc(
 			func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/restart":
 					ch <- restart
+					time.Sleep(sleepTime * time.Second)
 				case "/stop":
 					fmt.Println("sending stop")
 					ch <- stop
+					time.Sleep(sleepTime * time.Second)
+				case "/start":
+					ch <- start
+					time.Sleep(sleepTime * time.Second)
+				case "/exit":
+					ch <- stop
+					time.Sleep(sleepTime * time.Second)
+					os.Exit(0)
 				default:
 					fmt.Fprintln(os.Stderr, "unknown command", r.URL.Path)
 				}
